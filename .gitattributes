@@ -1,0 +1,7 @@
+# Normalize line endings so Windows/macOS/Linux contributors don't churn diffs
+* text=auto eol=lf
+
+# Binary artifacts
+*.png binary
+*.jpg binary
+*.gz binary
