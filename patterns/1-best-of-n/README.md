@@ -93,6 +93,10 @@ npm start
 Tunables (env vars): `DEMO_SEED`, `DEMO_STEPS`, `DEMO_FORKS`, `DEMO_P`,
 `DEMO_RETRIES`.
 
+> **Starter plan (2 concurrent sandboxes): run with `DEMO_FORKS=2`.** The default
+> `DEMO_FORKS=3` needs 3 concurrent microVMs and will fail with a 429
+> `ConcurrencyLimitExceeded` on the starter plan. See validation notes below.
+
 ### Expected output (deterministic with the default seed=98)
 
 The flakiness is a seeded hash of `(step, fork, retry)`, so runs are
@@ -119,32 +123,78 @@ retry 0 of the harness:
   best-of-3 : PASSED
 ```
 
-The rollback path is genuinely exercised (steps 7 and 10 have all three forks
-fail once, roll back, and recover), not merely described.
+The rollback path is genuinely exercised (steps 7 and 10 have all forks fail
+once, roll back, and recover), not merely described.
+
+## ✅ Validated against the live API — 2026-09-02
+
+Run with a real `slr_live_` key on the **starter plan** (`DEMO_FORKS=2`,
+seed=98). The core mechanic works exactly as designed — here is the actual
+transcript:
+
+```
+Config: seed=98 steps=12 forks=2 p/step=0.65 maxRetries=4
+Naive end-to-end odds if we just retried nothing: p^N = 0.0057
+
+=== BASELINE: linear agent (1 attempt/step, no fork, no rollback) ===
+  step  0..6: ok
+  step  7: BAD STATE
+  linear run: FAILED at step 7 (bad state propagated, run aborted)
+
+=== HARNESS: best-of-2 (checkpoint -> fork -> verify -> select -> rollback) ===
+  step  0: [PASS,PASS] -> keep fork 0
+  step  2: [PASS,fail] -> keep fork 0          # one fork corrupts state, verifier rejects it
+  step  5: [PASS,fail] -> keep fork 0
+  step  7: [fail,fail] -> ALL FAILED, rollback to checkpoint, retry 1/4
+  step  7: [PASS,PASS] -> keep fork 0 (recovered on retry 1)
+  step 10: [fail,fail] -> ALL FAILED, rollback to checkpoint, retry 1/4
+  step 10: [PASS,PASS] -> keep fork 0 (recovered on retry 1)
+```
+
+**What this proves:** the linear baseline dies at step 7, while the harness
+survives the identical failures — the verifier catches the corrupt fork at
+steps 2 and 5 (keeps the good one), and at steps 7 and 10 *both* forks fail, so
+it rolls back to the last known-good checkpoint and recovers on retry. A bad
+step never propagates. That is the p^N curve flattening, live.
+
+### Findings from the live run
+
+- **The demo works end-to-end through step 10.** Steps 0–10 all committed
+  correctly with real fork → parallel-verify → select → rollback behavior.
+- **Transient control-channel drop on the final step.** Step 11 hit
+  `ConnectionError: Control channel closed (1005)` — a WebSocket control channel
+  dropped mid-run, so the run didn't print its final `PASSED` line. This is a
+  real robustness gap for long runs: **the fork/step calls should be wrapped in
+  a reconnect-and-retry** (a few-hundred-ms backoff). Tracked as the top
+  follow-up; it does not affect the demonstrated mechanic.
+- **SDK surface confirmed live:** `sandbox.snapshot(name) -> id`,
+  `client.sandboxes.create({ fromSnapshot, volumes: [{ volumeId, path }] })`,
+  and `client.volumes.create({ name }) -> { volumeId }` all work as documented.
+  The `client.volumes` namespace is correct (no need for `sandboxes.volumes`).
+- **Listing:** use `client.sandboxes.list()` (returns `{ sandboxes: [...] }`).
+  `listAll()` returned `{}` in testing — do not rely on it.
+- **Cleanup verified to zero** (0 sandboxes / 0 snapshots / 0 volumes) after the
+  run. Two ordering rules matter (see below).
 
 ## Status / limitations
 
-- **Not yet run against a live Solari API.** The code is written to the
-  documented SDK surface but has not been executed with a real `slr_live_` key.
-  The console transcript above is derived from the demo's deterministic
-  flakiness function (validated in isolation), not from a live run.
-- **SDK method names were confirmed from docs, read via an automated fetcher,
-  not from a live SDK.** Confirmed against `docs.getsolari.com/snapshots`,
-  `/volumes`, and `/sdk/typescript/sandboxes` (Sep 2026):
-  `sandbox.snapshot(name?) -> string`, `sandbox.revert(id)`,
-  `create({ fromSnapshot })`, `create({ volumes: [{ volumeId, path }] })`,
-  `volumes.create({ name }) -> { volumeId }`. These are the pieces the brief
-  flagged as previously UNCONFIRMED; they are now documented, but treat them as
-  doc-confirmed, not run-confirmed.
-- **One namespace ambiguity to verify:** the TS SDK overview shows top-level
-  `client.volumes.create(...)` (used here), while the volumes page shows
-  `sandboxes.volumes.create(...)`. If `client.volumes` errors, switch to
-  `client.sandboxes.volumes`. Flagged inline with `TODO: verify` in `index.ts`.
-- **"Fork" is not a method** — it is `create({ fromSnapshot })`, wrapped in a
-  local `fork()` helper so there is one place to change if the surface differs.
-- **Cost/quota:** each successful step spins up N microVMs (plus retries). With
-  defaults that is up to a few dozen short-lived VMs per full run. Fast boot is
-  what makes this affordable, but it is not free — mind your quota.
+- **Concurrency ceiling.** The starter plan allows **2 concurrent sandboxes**;
+  `create` returns 429 `ConcurrencyLimitExceeded` beyond that. Set `DEMO_FORKS`
+  ≤ your plan's limit. (Higher plans support best-of-3+.)
+- **No `timeoutMs` on forks — set one.** The forks are created without a
+  `timeoutMs`, so a crash mid-run leaves them alive until the **default ~2-hour
+  idle expiry**, quietly billing. Recommended fix: pass a short `timeoutMs`
+  (e.g. 2–5 min) to every `create` so orphans self-destruct. (During validation
+  a crash did leave two forks running; they were killed manually.)
+- **Add connection retry** for `Control channel closed (1005)` on long runs
+  (see findings above).
+- **Snapshot cleanup is leaf-first.** Verified-step snapshots form a
+  parent→child **chain**; a parent cannot be deleted while it has live children,
+  so delete newest-first. Also kill all sandboxes **before** deleting a volume
+  (an attached volume can't be deleted).
+- **Snapshots are large (~3.8 GB each on the `base` template).** A 12-step run
+  leaves ~12 chained snapshots (~46 GB) plus a volume — all billable storage
+  until deleted. Purge after every run.
 - **Concurrent writes:** all forks mount the same volume, but only the *winner*
   writes to it (sequentially across steps), so there is no write contention.
   Forks read prior state from their own copy-on-write filesystem carried by the

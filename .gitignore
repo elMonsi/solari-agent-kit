@@ -5,8 +5,15 @@
 *.key
 slr_live_*
 
+# Scratch tooling used during validation (inventory/cleanup probes) — never commit
+_*.mjs
+_*.cjs
+_*.py
+
 # Node
 node_modules/
+package-lock.json
+pnpm-lock.yaml
 dist/
 *.tsbuildinfo
 npm-debug.log*
