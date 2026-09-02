@@ -84,40 +84,60 @@ export SOLARI_API_KEY=slr_live_...   # https://console.getsolari.com
 python main.py
 ```
 
-During the human-takeover pause, open the printed `streamUrl` in any VNC viewer
-to watch/act live, then press ENTER in the console to resume.
+During the human-takeover pause, open the printed `streamUrl` in a VNC viewer
+(see note below — it's a `wss://` WebSocket stream, not a plain browser link),
+then press ENTER in the console to resume. To run non-interactively, pipe a
+newline: `echo "" | python main.py`.
+
+## ✅ Validated against the live API — 2026-09-02
+
+Run with a real `slr_live_` key on the starter plan. **Works end-to-end.** The
+`FreezeHandoff` wrapper resolved to the *real* Python methods — no guessing
+needed. Actual transcript:
+
+```
+opened mousepad, pid 510
+  !! RISK GATE HIT: 2FA code required to authorize the purchase
+  [FreezeHandoff] snapshot via desktop.snapshot('at-2fa-gate') -> snap_dl4ffxsyalrs
+  [FreezeHandoff] parked via desktop.pause() — VM scaled to zero
+  >> HUMAN TAKEOVER  ... Press ENTER once the human step is complete...
+  [FreezeHandoff] resumed via desktop.resume(...) — state intact
+screenshot: screenshot-after-resume.png (73816 bytes)
+```
+
+**State survived the freeze — verified from the screenshot.** After
+`pause()` → `resume()`, the mousepad still showed the pre-freeze form line
+(`... 2FA code:`) with the post-resume text (`status: 2FA cleared by human,
+order CONFIRMED by agent`) appended right after it. Same document, same cursor
+position — no re-execution of the earlier keystrokes.
+
+### Findings from the live run
+
+- **Python method names are all confirmed** on the `Desktop` object:
+  `snapshot(name) -> id`, `pause()`, `resume()` all exist and work (also
+  `revert`, `reconnect`, `preview_url`). The `FreezeHandoff` probe found each on
+  its first candidate. (You can simplify it to direct calls now, or keep it as a
+  portable shim.)
+- **`pause`/`resume` work on desktops** with the expected semantics (parked, then
+  resumed with state intact) — the earlier open question is resolved.
+- **`streamUrl` is a `wss://` WebSocket VNC stream** (`wss://api.getsolari.com/stream/<id>`),
+  not an `https` page — open it with a VNC-over-WebSocket viewer (e.g. noVNC),
+  not directly in a browser address bar.
+- **TLS behind a corporate proxy:** on a machine whose network does SSL
+  interception with a private root CA, Python's `httpx`/`certifi` bundle rejects
+  the chain (`CERTIFICATE_VERIFY_FAILED: self-signed certificate`). Fix without
+  code changes: `pip install pip-system-certs` (bridges Python to the OS trust
+  store). The Node patterns weren't affected. Env-specific, not a code issue.
+- **Cleanup:** `client.destroy(sessionId)` runs in `finally` and removed the
+  desktop; the demo **keeps** its `at-2fa-gate` snapshot (delete it afterward —
+  desktop snapshots appear under `sandboxes.listSnapshots()` /
+  `deleteSnapshot()`). Account verified back to 0 after cleanup. Note: desktop
+  snapshots are large (~5.5 GB here).
 
 ## Status / limitations
 
-**This example has NOT been run against the live Solari API.** It is written to
-match the confirmed cookbook style and the documented API surface.
-
-**Confirmed** (cookbook `desktop-computer-use-py` + docs.getsolari.com):
-`DesktopClient(api_key, base_url)`, `client.create(template, resolution,
-timeout_ms)`, `desktop.connect()`, `desktop.health().ready`, `desktop.open(app)`,
-`desktop.mouse.click(x, y, humanize=...)`, `desktop.keyboard.type(text)`,
-`desktop.screenshot(format=...)`, `desktop.sessionId`, `desktop.streamUrl`,
-teardown `desktop.close()` then `client.destroy(sessionId)`.
-
-**Confirmed concepts, TypeScript method names only** (docs.getsolari.com
-`/snapshots` and `/desktops`): `snapshot(name)` returns a snapshot id;
-`revert(id)`; `create({ fromSnapshot })`; `pause()` (parked machines "won't be
-shut down for being idle"); `resume()`; and `desktops.connect(id)` which
-"resumes if paused." All examples on those pages are TypeScript.
-
-**UNCONFIRMED — needs verification before this runs for real:**
-
-- The exact **Python** method names for snapshot / pause / resume on
-  `solari-desktop`. The docs show TypeScript only, and the PyPI page for
-  `solari-desktop` would not load (Cloudflare "client challenge") to confirm the
-  Python surface.
-- Because of that, `main.py` routes every freeze/resume call through the
-  `FreezeHandoff` wrapper, which probes the likely Python spellings
-  (`snapshot`/`pause`/`resume`, plus `desktops.connect(id)` to re-attach) and
-  **fails loudly listing what it tried** rather than inventing a method. Search
-  for `TODO: verify against Solari SDK`.
-- Whether `pause`/scale-to-zero is available on **desktops** specifically (vs.
-  headless sandboxes) with identical semantics.
-- Resume-latency figures: the site references sub-second/millisecond resume but
-  no exact per-call figure (e.g. "0.78ms") was confirmable in the docs, so none
-  is quoted as fact here.
+- **The human wait is simulated** with `input()`/piped newline. In production the
+  human's answer re-attaches to a durable run id (LangGraph/Temporal style) so
+  the process can exit entirely while the VM stays parked.
+- **Resume-latency figures** from the site (sub-second/"0.78ms") were not
+  measured here, so none is quoted as fact.

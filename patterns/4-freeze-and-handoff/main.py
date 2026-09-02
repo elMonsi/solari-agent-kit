@@ -46,7 +46,13 @@ milliseconds rather than booting."
 --------------------------------------------------------------------------------
 STATUS / VERIFICATION (read before trusting the freeze calls)
 --------------------------------------------------------------------------------
-This example has NOT been run against the live Solari API.
+VALIDATED against the live Solari API on 2026-09-02 (starter plan). The Python
+methods below are all CONFIRMED to exist and work: desktop.snapshot(name),
+desktop.pause(), desktop.resume() (also revert/reconnect/preview_url). State
+survived pause->resume. The FreezeHandoff wrapper resolved each on its first
+candidate; you may inline the direct calls or keep the shim for portability.
+(Note: behind an SSL-intercepting corporate proxy, `pip install pip-system-certs`
+so Python trusts the OS cert store.)
 
 CONFIRMED from the cookbook + docs.getsolari.com:
   - Desktop lifecycle: DesktopClient(api_key, base_url), client.create(

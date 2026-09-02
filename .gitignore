@@ -29,6 +29,7 @@ venv/
 
 # Artifacts produced by examples
 screenshot.png
+screenshot*.png
 *.replay.ndjson
 replays/
 
