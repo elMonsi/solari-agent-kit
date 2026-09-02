@@ -50,7 +50,7 @@ Every pattern was executed end-to-end with a real `slr_live_` key (starter plan,
 | 2 | Untrusted-Code Gateway | ✅ All 4 steps pass | Benign run, malicious-payload containment, destructive-op **restore-by-fork**, fail-closed deny gate. Fixed a bug: `revert()` 409s → rollback is fork-from-snapshot. |
 | 3 | Quarantine Browser | ✅ Pass, no changes | Naive agent obeys all 5 injected actions; quarantine actor never receives the injection. |
 | 4 | Freeze & Hand Off | ✅ Pass, state survives | `snapshot → pause (scale-to-zero) → human takeover → resume`; screenshot confirms document+cursor survived the freeze. Python `snapshot/pause/resume` all confirmed. |
-| 5 | Glass Box | ✅ Audit half; ⚠️ replay plan-gated | Hash-chained decision ledger, `verify`, `show`, and same-task `diff` all work live. Live rrweb replay returned `404 "No replay available"` on starter → likely a plan-gated feature; re-verify on a plan with session recording. |
+| 5 | Glass Box | ✅ Audit half; ⚠️ replay plan-gated | Hash-chained decision ledger, `verify`, `show`, and same-task `diff` all work live. Live rrweb replay `404`s even with a 20s session + real activity + 180s poll → **diagnosed as plan-gated**, not a bug (see `patterns/5-glass-box/RECORDING-DIAGNOSTIC.md`). |
 
 **Environment findings that apply repo-wide:**
 

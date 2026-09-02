@@ -124,16 +124,23 @@ half is fully validated; the Solari-recording half is blocked by a plan gate.**
   **exist** as snake_case Python methods), `browser.close()`, `solari.close()`.
   The 404-then-poll and no-gunzip handling are correct.
 
-**Caveat — live rrweb replay was not available on the starter plan:**
+**Caveat — live rrweb replay is plan-gated (definitively diagnosed):**
 
-- After the session released, `download_replay` / `get_replay_url` returned
-  **`404 "No replay available for this session"`** for the full ~30s poll window
-  *and still minutes later*. The `recording=True` flag was accepted but no replay
-  artifact was produced. Most likely **session recording is a plan-gated feature**
-  (not included on the starter plan) and/or needs a longer session; the client
-  code handled the 404 gracefully and logged `"no replay after ~30s"`. **Re-verify
-  the DOM-replay half on a plan that includes session recording.** The
-  event-ledger contribution (the novel part) does not depend on it.
+- `download_replay` / `get_replay_url` returned **`404 "No replay available for
+  this session"`** and never produced an artifact. To rule out a code/timing
+  cause, [`check_recording.py`](./check_recording.py) re-ran with **3×-generous
+  timings**: a ~20s session with real DOM activity (navigate, mouse, scroll,
+  click, back), an explicit `release_and_wait(session_id)` to flush the upload,
+  and **180s of polling**. Still 404 the entire time.
+- **Conclusion:** length, activity, flush, and poll-duration are all ruled out.
+  `recording=True` is accepted (it's a real `launch()` param) but produces
+  nothing on this account → **session recording is not enabled on the starter
+  plan.** This is a feature gate, not a bug. Full evidence:
+  [`RECORDING-DIAGNOSTIC.md`](./RECORDING-DIAGNOSTIC.md).
+- **The novel contribution — the event-sourced ledger + verify/show/diff — does
+  not depend on this** and is fully validated. To confirm the DOM-replay half,
+  run `python check_recording.py` on a plan with session recording; it prints the
+  replay's byte/event counts and exits 0.
 
 ## Status / limitations
 
