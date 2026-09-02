@@ -39,23 +39,45 @@ environment.** Reversible safety, audit/replay, human handoff, and best-of-N
 reliability are all the same capability viewed from different angles. This repo
 demonstrates that capability as the answer to the field's hardest problems.
 
-## Status
+## Validation — all five run against the live Solari API ✅
 
-🚧 Early. Scaffolding and the first patterns are in progress. See each
-`patterns/<name>/` directory for its own README and runnable example.
+Every pattern was executed end-to-end with a real `slr_live_` key (starter plan,
+2026-09-02). Each pattern's own README has the full transcript and findings.
 
-## Repo layout (planned)
+| # | Pattern | Result | Notes |
+| --- | --- | --- | --- |
+| 1 | Best-of-N on Real State | ✅ Core mechanic proven | Linear baseline fails at step 7; harness recovers via rollback+retry (steps 7, 10). Run with `DEMO_FORKS=2` on starter (2-concurrent cap). A transient control-channel drop (1005) hit the last step → add reconnect-retry. |
+| 2 | Untrusted-Code Gateway | ✅ All 4 steps pass | Benign run, malicious-payload containment, destructive-op **restore-by-fork**, fail-closed deny gate. Fixed a bug: `revert()` 409s → rollback is fork-from-snapshot. |
+| 3 | Quarantine Browser | ✅ Pass, no changes | Naive agent obeys all 5 injected actions; quarantine actor never receives the injection. |
+| 4 | Freeze & Hand Off | ✅ Pass, state survives | `snapshot → pause (scale-to-zero) → human takeover → resume`; screenshot confirms document+cursor survived the freeze. Python `snapshot/pause/resume` all confirmed. |
+| 5 | Glass Box | ✅ Audit half; ⚠️ replay plan-gated | Hash-chained decision ledger, `verify`, `show`, and same-task `diff` all work live. Live rrweb replay returned `404 "No replay available"` on starter → likely a plan-gated feature; re-verify on a plan with session recording. |
+
+**Environment findings that apply repo-wide:**
+
+- **Concurrency:** the starter plan allows **2 concurrent sessions** (sandboxes /
+  browsers / desktops). Fan-out patterns must respect this.
+- **Snapshots are large & chained** (~3.8 GB sandbox, ~5.5 GB desktop) and delete
+  **leaf-first**; kill sandboxes before deleting an attached volume. Always purge
+  after a run — see each README.
+- **Rollback = fork-from-snapshot** (`create({ fromSnapshot })`), **not** in-place
+  `revert()` (which returns 409 on a running VM).
+- **Listing:** use `sandboxes.list()` (not `listAll()`, which returned `{}`).
+  `sessions` (browser) has no `list()` — track sessions yourself.
+- **Python behind an SSL-intercepting corporate proxy:** `pip install
+  pip-system-certs` so `httpx` trusts the OS cert store (Node was unaffected).
+
+## Repo layout
 
 ```
 solari-agent-kit/
 ├── README.md
 ├── docs/                  # problem research, impact model, design notes
 └── patterns/
-    ├── 1-best-of-n/
-    ├── 2-untrusted-code-gateway/
-    ├── 3-quarantine-browser/
-    ├── 4-freeze-and-handoff/
-    └── 5-glass-box/
+    ├── 1-best-of-n/            (TypeScript)
+    ├── 2-untrusted-code-gateway/  (TypeScript)
+    ├── 3-quarantine-browser/  (TypeScript)
+    ├── 4-freeze-and-handoff/  (Python)
+    └── 5-glass-box/           (Python)
 ```
 
 ## Running
