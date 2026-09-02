@@ -66,8 +66,13 @@ interface SafeExecResult {
   stderr: string
   /** True when the command was allowed to run (gate passed / not risky). */
   ran: boolean
-  /** Populated when a risky run was rolled back to a pre-run snapshot. */
-  rolledBackTo?: string
+  /**
+   * For a `risky` run: the id of the pre-exec snapshot. Restore by FORKING it —
+   * `client.sandboxes.create({ fromSnapshot })` — not by reverting in place.
+   * (Live API note: `sandbox.revert(id)` on a running VM returns 409
+   * "Not revertable"; fork-from-snapshot is the supported rollback. See README.)
+   */
+  snapshotId?: string
   /** Where the command executed — always a disposable VM, never the host. */
   ranIn: "solari-sandbox-microvm"
 }
@@ -83,8 +88,9 @@ const denyByDefault: ApproveFn = () => false
  * pipes/globs/redirection, pass command="sh" and args=["-c", "<script>"] so the
  * shell interpretation happens INSIDE the VM, never on the host.
  *
- * For a `risky` command we snapshot the VM first, run, and — in this demo —
- * roll back afterward to prove the op is fully reversible. In production you'd
+ * For a `risky` command we snapshot the VM first and return the snapshot id so
+ * the caller can restore by FORKING it (create({ fromSnapshot })) — the demo
+ * does exactly that to prove the op is fully reversible. In production you'd
  * keep the post-run state only if a verifier passes (fork-verify-or-rollback).
  */
 export async function safeExec(
@@ -125,28 +131,21 @@ export async function safeExec(
     }))
   const ownsSandbox = !opts.sandbox
 
-  let rolledBackTo: string | undefined
+  let snapshotId: string | undefined
   try {
-    // Control channel — needed for files + snapshot/revert.
+    // Control channel — needed for files + snapshot.
     await sandbox.connect()
 
-    // Snapshot-before / roll-back-after so a destructive run is reversible.
+    // Snapshot BEFORE a risky run so the pre-exec state is recoverable.
     // snapshot() saves the machine's current state and returns a snapshot id
-    // while the machine keeps running; revert() rewinds the SAME machine to it.
-    let snapId: string | undefined
+    // while the machine keeps running. To roll back you FORK this snapshot into
+    // a fresh VM (create({ fromSnapshot })) — see the demo. (In-place revert()
+    // is not supported on a running VM: it returns 409 "Not revertable".)
     if (opts.risky) {
-      snapId = await sandbox.snapshot(`pre-exec-${Date.now()}`)
+      snapshotId = await sandbox.snapshot(`pre-exec-${Date.now()}`)
     }
 
     const out = await sandbox.commands.run(command, { args })
-
-    // Reversibility demo: after a risky op we rewind to the pre-run snapshot,
-    // so even a `rm -rf`-style command leaves no lasting damage. In production
-    // you'd gate the rollback on a verifier ("keep the fork only if it passes").
-    if (opts.risky && snapId) {
-      await sandbox.revert(snapId)
-      rolledBackTo = snapId
-    }
 
     return {
       command,
@@ -157,7 +156,7 @@ export async function safeExec(
       stdout: out.stdout ?? "",
       stderr: (out as { stderr?: string }).stderr ?? "",
       ran: true,
-      rolledBackTo,
+      snapshotId,
       ranIn: "solari-sandbox-microvm",
     }
   } finally {
@@ -219,17 +218,21 @@ async function main() {
   console.log(`    exit=${exfil.exitCode} (host ~/.ssh untouched; only the VM decoy was read)\n`)
 
   // -------------------------------------------------------------------------
-  // 3) Snapshot -> run-risky -> rollback for a DESTRUCTIVE command.
+  // 3) Snapshot -> run-risky -> RESTORE-BY-FORK for a DESTRUCTIVE command.
   //
-  // We seed a file, snapshot, delete everything, then revert — proving the
-  // destructive op was reversible. The Replit prod-DB-wipe is exactly the
-  // failure this prevents: a destructive command with no undo.
-  // We must approve it first because it is flagged `risky`.
+  // We seed a file, snapshot, delete it, then restore by forking the snapshot
+  // into a fresh VM — proving the destructive op was reversible. The Replit
+  // prod-DB-wipe is exactly the failure this prevents: a destructive command
+  // with no undo. We must approve it first because it is flagged `risky`.
+  //
+  // NOTE (live-API verified): rollback is FORK-from-snapshot, not in-place
+  // revert(). `sandbox.revert(id)` returns 409 "Not revertable" on a running
+  // VM, so we discard the mutated VM and boot a fresh copy of the snapshot.
   // -------------------------------------------------------------------------
-  console.log("[3] snapshot -> destructive op -> rollback (reversible run):")
+  console.log("[3] snapshot -> destructive op -> restore-by-fork (reversible run):")
 
-  // A shared sandbox so we can observe state across the snapshot/revert.
   const box = await pt.sandboxes.create({ template: "base", timeoutMs: 5 * 60_000 })
+  let snapId: string | undefined
   try {
     await box.connect()
     await box.files.write("/tmp/important.txt", "critical production data\n")
@@ -241,31 +244,48 @@ async function main() {
       return true
     }
 
-    // Destructive command, gated + snapshotted + auto-rolled-back by safeExec.
+    // Destructive command: gated + snapshotted by safeExec (returns the snap id).
     const wipe = await safeExec("rm", ["-rf", "/tmp/important.txt"], {
       risky: true,
       approve: approveForDemo,
       sandbox: box,
     })
-    console.log(`    ran=${wipe.ran} exit=${wipe.exitCode} rolledBackTo=${wipe.rolledBackTo}`)
+    snapId = wipe.snapshotId
+    console.log(`    ran=${wipe.ran} exit=${wipe.exitCode} snapshotId=${snapId}`)
 
-    // Because safeExec reverted the VM to the pre-wipe snapshot, the file is
-    // back. The destructive op happened, was observed, and left no damage.
-    const check = await box.files.readText("/tmp/important.txt").catch(() => "<gone>")
-    console.log(`    after rollback, /tmp/important.txt = ${JSON.stringify(check.trim())}`)
-    console.log("    -> destructive op was fully reversible\n")
+    // In the mutated VM the file is now gone — the destructive op really ran.
+    const gone = await box.files.readText("/tmp/important.txt").catch(() => "<gone>")
+    console.log(`    in mutated VM, /tmp/important.txt = ${JSON.stringify(gone.trim())}`)
 
-    // ---------------------------------------------------------------------
-    // 4) Approval gate DENY path (fail-closed default).
-    //
-    // With no approver, a risky command is DENIED and never executes.
-    // ---------------------------------------------------------------------
-    console.log("[4] Approval gate DENY (fail-closed default):")
+    // 4) Approval gate DENY path (fail-closed default) — do it here while `box`
+    //    is the only live VM, so we never exceed the concurrency limit.
+    console.log("\n[4] Approval gate DENY (fail-closed default):")
     const denied = await safeExec("rm", ["-rf", "/"], { risky: true, sandbox: box })
     console.log(`    ran=${denied.ran} exit=${denied.exitCode}`)
-    console.log(`    ${denied.stderr}\n`)
+    console.log(`    ${denied.stderr}`)
   } finally {
-    await box.kill()
+    await box.kill() // discard the mutated VM before forking the snapshot
+  }
+
+  // RESTORE: fork the pre-wipe snapshot into a fresh VM — the file is back.
+  if (snapId) {
+    console.log("\n    restoring by forking the pre-wipe snapshot ...")
+    const restored = await pt.sandboxes.create({
+      template: "base",
+      fromSnapshot: snapId,
+      timeoutMs: 5 * 60_000,
+    })
+    try {
+      await restored.connect()
+      const back = await restored.files.readText("/tmp/important.txt").catch(() => "<gone>")
+      console.log(`    in forked VM, /tmp/important.txt = ${JSON.stringify(back.trim())}`)
+      console.log("    -> destructive op was fully reversible (restore-by-fork)\n")
+    } finally {
+      await restored.kill()
+      // Hygiene: delete the snapshot now that we're done (children must be gone
+      // first — the forked VM above is already killed).
+      await pt.sandboxes.deleteSnapshot(snapId).catch(() => {})
+    }
   }
 
   console.log("=== done — every command executed in a disposable microVM, never on the host ===")

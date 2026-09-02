@@ -36,8 +36,8 @@ runs.**
 | --- | --- | --- |
 | **Disposable microVM per run** | `safeExec()` spins a fresh Solari sandbox, runs the command, then `kill()`s it. Nothing it does can touch your machine or another tenant. | Even if malicious code runs *before* a trust prompt (CurXecute / mcp-remote / Claude Code CVEs), it runs in a throwaway box — least-privilege isolation. |
 | **Approval gate (allowlist, fail-closed)** | Commands flagged `risky` must clear an explicit `approve()` decision; the default **denies**. | "Allowlists not denylists" + per-action confirmation for destructive/authenticated ops. You can't enumerate every dangerous command, so deny-by-default. |
-| **Snapshot -> run -> rollback** | For a `risky` op, `safeExec()` calls `snapshot()` before running and `revert()`s the VM afterward, so a destructive command is fully reversible. | Directly prevents the Replit-style irreversible prod wipe: the destructive op happens, is observed, and leaves no lasting damage. |
-| **Tamper-evident result** | Returns `{ exitCode, stdout, stderr, ran, rolledBackTo, ranIn }` so the agent sees exactly what happened and where. | Execution log the agent can inspect / audit. |
+| **Snapshot -> run -> restore-by-fork** | For a `risky` op, `safeExec()` calls `snapshot()` before running and returns the snapshot id; to roll back you **fork** it into a fresh VM (`create({ fromSnapshot })`), so a destructive command is fully reversible. | Directly prevents the Replit-style irreversible prod wipe: the destructive op happens, is observed, and leaves no lasting damage. |
+| **Tamper-evident result** | Returns `{ exitCode, stdout, stderr, ran, snapshotId, ranIn }` so the agent sees exactly what happened and where. | Execution log the agent can inspect / audit. |
 
 ## Solari primitive used
 
@@ -51,7 +51,9 @@ Methods used: `sandboxes.create({ template, timeoutMs, fromSnapshot? })`,
 `sandbox.connect()`, `sandbox.commands.run(cmd, { args })` (**not**
 shell-interpreted — argv in `args`, or run `sh -c` explicitly),
 `sandbox.files.write/readText`, `sandbox.snapshot(name)`,
-`sandbox.revert(snapshotId)`, `sandbox.kill()`.
+`sandboxes.deleteSnapshot(id)`, `sandbox.kill()`. Rollback is
+**fork-from-snapshot** (`create({ fromSnapshot })`), *not* in-place `revert()`
+(see validation note below).
 
 ## What the demo shows
 
@@ -61,9 +63,9 @@ shell-interpreted — argv in `args`, or run `sh -c` explicitly),
    to `attacker.example`. It runs **harmlessly** — the secret it reads is the
    decoy in the throwaway VM, the host's real `~/.ssh` is never in scope, and
    the entire exfil attempt is **visible in the returned log**.
-3. **snapshot -> destructive `rm -rf` -> rollback**: a seeded file is deleted,
-   then the VM is reverted to the pre-run snapshot, proving the destructive op
-   was reversible.
+3. **snapshot -> destructive `rm -rf` -> restore-by-fork**: a seeded file is
+   deleted (gone in the mutated VM), then the pre-wipe snapshot is forked into a
+   fresh VM where the file is back — proving the destructive op was reversible.
 4. The **approval gate DENY path**: with no approver, a risky command
    (`rm -rf /`) is blocked and never executes.
 
@@ -77,21 +79,53 @@ export SOLARI_API_KEY=slr_live_...   # https://console.getsolari.com
 npm start
 ```
 
-## Status / limitations
+## ✅ Validated against the live API — 2026-09-02
 
-- **Not run against the live Solari API.** This example was written and
-  type-reviewed but not executed end-to-end against a real key. Exact
-  argument/return shapes may differ slightly from what's shown.
-- **Snapshot / revert / `fromSnapshot`** (`sandbox.snapshot(name)`,
-  `sandbox.revert(snapshotId)`, `sandboxes.create({ fromSnapshot })`) are
-  confirmed from the docs at https://docs.getsolari.com/snapshots and
-  https://docs.getsolari.com/sandboxes, but were **not verified against a live
-  SDK build**. If your installed `@solarisdk/sdk` names these differently (e.g.
-  `sandboxes.snapshot(id)` vs `sandbox.snapshot()`), adjust the two calls in
-  `index.ts` marked around the snapshot/rollback flow. Treat them as the one
-  spot to double-check.
-- **`commands.run` stderr**: `stdout`/`exitCode` are confirmed; `stderr` is read
-  defensively (`out.stderr ?? ""`) in case the field name differs.
+Run with a real `slr_live_` key on the starter plan. **All four steps pass.**
+Actual transcript:
+
+```
+[1] Benign command in a disposable microVM:
+    exit=0 stdout=5050 ranIn=solari-sandbox-microvm
+
+[2] Malicious payload (fake secret exfil) — contained in the VM:
+    [payload] read secret from VM: FAKE-PLACEHOLDER-PRIVATE-KEY-not-a-real-secret
+    [payload] attempting exfil POST to attacker.example ...
+    [payload] exfil FAILED (contained: no host creds, disposable VM)
+    exit=0 (host ~/.ssh untouched; only the VM decoy was read)
+
+[3] snapshot -> destructive op -> restore-by-fork (reversible run):
+    seeded /tmp/important.txt
+    [gate] approving risky: rm -rf /tmp/important.txt
+    ran=true exit=0 snapshotId=snap_...
+    in mutated VM, /tmp/important.txt = "<gone>"
+
+[4] Approval gate DENY (fail-closed default):
+    ran=false exit=126
+    [gateway] BLOCKED by approval gate: rm -rf /
+
+    restoring by forking the pre-wipe snapshot ...
+    in forked VM, /tmp/important.txt = "critical production data"
+    -> destructive op was fully reversible (restore-by-fork)
+```
+
+### Findings from the live run
+
+- **Containment works:** the malicious payload reads only the in-VM decoy and its
+  exfil POST fails; the host is never in scope.
+- **`sandbox.revert(snapshotId)` is NOT supported for in-place rollback** — it
+  returned `409 "Not revertable"` on a running VM. **The working rollback is
+  fork-from-snapshot**: `client.sandboxes.create({ fromSnapshot })` into a fresh
+  VM (this is also how pattern 1 rolls back). The code was updated accordingly;
+  `safeExec` now returns `snapshotId` and the demo restores by forking it.
+- **`commands.run` returns `stdout` and `exitCode`;** `stderr` was empty in
+  testing and is read defensively.
+- **Concurrency:** the demo uses ≤1 sandbox at a time, so it runs fine on the
+  starter plan's 2-concurrent limit.
+- **Cleanup verified to zero** — the demo deletes its own pre-exec snapshot after
+  restoring; account showed 0 sandboxes / 0 snapshots / 0 volumes afterward.
+
+## Status / limitations
 - **Egress allowlisting / filesystem scoping** are *not* configured here.
   AI-RESEARCH.md (Problem 1b / Idea 2) flags per-VM network-egress allowlisting
   and filesystem scoping as **unconfirmed** in the Solari docs — the demo relies
@@ -102,5 +136,6 @@ npm start
 - The `risky` flag is set by the caller in this demo. In production you'd wire a
   real classifier (destructive verbs, network tools, package post-install hooks)
   into the gate.
-- **npmjs.com** returned HTTP 403 during verification, so the package version
-  (`^0.1.2`) is matched to the cookbook examples rather than confirmed live.
+- **`@solarisdk/sdk@^0.1.2` installs and runs** against the live API (confirmed);
+  the earlier npm-registry 403 during authoring was a fetch issue, not a version
+  problem.
