@@ -100,24 +100,43 @@ In `--offline` mode the Solari calls are skipped (recorded in the ledger as
 skipped), so you can see the event-sourcing, tamper-check and diff without a key
 or a live session. A live run adds the real rrweb replay.
 
+## ✅ Validated against the live API — 2026-09-02 (with one caveat)
+
+Run with a real `slr_live_` key on the starter plan. **The event-sourced audit
+half is fully validated; the Solari-recording half is blocked by a plan gate.**
+
+**Works (live + local):**
+
+- **Live browser run + decision ledger.** `solari.launch(recording=True)` was
+  accepted, the task ran against `example.com`, and every step
+  (`run_start → browser_launch → tool_call → extract → decision → approval →
+  replay_download → run_end`) was written to a **hash-chained** `events.jsonl` the
+  moment it happened.
+- **`replay.py verify`** → `chain verified, no tampering detected`.
+- **`replay.py show`** → reconstructs the run deterministically from the log
+  (no re-execution).
+- **`--demo` diff** → correctly pinpoints where two runs of the *same* task
+  diverge (`decision → approval → run_end`) — the reproducibility gap made
+  concrete.
+- **SDK names confirmed live:** `solari.launch(recording=True)` (the `recording`
+  param is real — verified in the `launch()` signature), `browser.id`,
+  `sessions.download_replay(session_id)` and `sessions.get_replay_url(id)` (both
+  **exist** as snake_case Python methods), `browser.close()`, `solari.close()`.
+  The 404-then-poll and no-gunzip handling are correct.
+
+**Caveat — live rrweb replay was not available on the starter plan:**
+
+- After the session released, `download_replay` / `get_replay_url` returned
+  **`404 "No replay available for this session"`** for the full ~30s poll window
+  *and still minutes later*. The `recording=True` flag was accepted but no replay
+  artifact was produced. Most likely **session recording is a plan-gated feature**
+  (not included on the starter plan) and/or needs a longer session; the client
+  code handled the 404 gracefully and logged `"no replay after ~30s"`. **Re-verify
+  the DOM-replay half on a plan that includes session recording.** The
+  event-ledger contribution (the novel part) does not depend on it.
+
 ## Status / limitations
 
-- **Not run against the live Solari API.** The offline path (`--offline`,
-  `replay.py verify/show/diff`) was executed and works; the live path was written
-  against the recording cookbook example and the docs but not exercised.
-- **Confirmed SDK surface** (docs.getsolari.com + the `browser-session-recording-py`
-  cookbook): `Solari(api_key=...)`, `solari.launch(recording=True)`, `browser.id`,
-  `browser.new_page()`, `page.goto()`, `page.locator(...).inner_text()`,
-  `browser.close()`, `solari.close()`, `solari-browser>=0.1.3` (latest on PyPI,
-  released 2026-09-01).
-- **`TODO: verify` — `solari.sessions.download_replay(session_id)` (Python name).**
-  The docs document only the **camelCase** `sessions.downloadReplay` (TypeScript);
-  the snake_case Python name, the gzip **auto-decompress** behavior (don't
-  `gzip.decompress()`), and the **async-upload / 404-then-poll** behavior all come
-  from the Python cookbook example rather than the published API reference.
-- **`TODO: verify` — `sessions.getReplayUrl` / `get_replay_url`.** The docs mention
-  a `getReplayUrl(sessionId)` returning a shareable link; this example does not use
-  it (it downloads the raw NDJSON instead). Python name unconfirmed.
 - **The "decision" step is a stochastic stand-in for an LLM call**, not a real
   model. It exists to demonstrate the non-determinism/divergence honestly; swap it
   for your model call in production. Divergence in `--demo` is therefore
