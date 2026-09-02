@@ -50,6 +50,10 @@ const N_STEPS = Number(process.env.DEMO_STEPS ?? 12) // length of the fragile pi
 const N_FORKS = Number(process.env.DEMO_FORKS ?? 3) // the "N" in best-of-N
 const P_STEP = Number(process.env.DEMO_P ?? 0.65) // per-attempt success probability
 const MAX_RETRIES = Number(process.env.DEMO_RETRIES ?? 4) // rollback+retry budget per step
+// Every microVM gets a short idle timeout so a crash mid-run can NEVER leave an
+// orphan billing until the (multi-hour) default idle expiry. If the process dies,
+// the VMs self-destruct within IDLE_MS.
+const IDLE_MS = Number(process.env.DEMO_IDLE_MS ?? 5 * 60_000)
 
 const WORK_LOG = "/work/pipeline.log" // in-VM working state (copy-on-write per fork)
 const DATA_LOG = "/data/pipeline.log" // durable, EXTERNAL state (on the volume)
@@ -84,20 +88,74 @@ const attemptSucceeds = (step: number, fork: number, retry: number): boolean =>
 const expectedMarker = (step: number) => `STEP-${step}-OK`
 
 // --------------------------------------------------------------------------
+// Transient-failure handling. Long runs over a WebSocket control channel WILL
+// hit occasional drops and rate limits. Two kinds, handled differently:
+//
+//   * isRateLimited(429): a slot is temporarily full. Back off and retry the
+//     SAME call — a freed slot reopens shortly. (Used only around fork/create.)
+//   * isChannelDead(...): the fork's control channel is gone ("Control channel
+//     closed (1005)", "Not connected", "exec failed"). You CANNOT recover by
+//     retrying that dead channel — the only fix is to throw the fork away and
+//     re-fork a fresh one. So these bubble up to the step-level catch, which
+//     discards all forks and retries the step from the last good checkpoint.
+//
+// Validated: retrying a dead channel just yields "Not connected"; re-forking works.
+// --------------------------------------------------------------------------
+function isRateLimited(e: unknown): boolean {
+  const status = (e as { status?: number })?.status
+  const m = String((e as { message?: string })?.message ?? e)
+  return status === 429 || status === 502 || status === 503 || m.includes("concurrent")
+}
+function isChannelDead(e: unknown): boolean {
+  const m = String((e as { message?: string })?.message ?? e)
+  return (
+    m.includes("Control channel closed") ||
+    m.includes("1005") ||
+    m.includes("Not connected") ||
+    m.includes("exec failed") ||
+    m.includes("ECONNRESET") ||
+    m.includes("socket hang up")
+  )
+}
+// A step is worth retrying-by-re-forking on either class of transient failure.
+const isRetryableStep = (e: unknown): boolean => isRateLimited(e) || isChannelDead(e)
+
+async function withRetry<T>(label: string, fn: () => Promise<T>, tries = 5): Promise<T> {
+  let last: unknown
+  for (let i = 1; i <= tries; i++) {
+    try {
+      return await fn()
+    } catch (e) {
+      last = e
+      // Only retry the SAME call for rate limits. A dead channel won't heal.
+      if (!isRateLimited(e) || i === tries) throw e
+      const backoff = 400 * 2 ** (i - 1)
+      console.log(
+        `  [retry] ${label}: ${String((e as Error).message ?? e).slice(0, 50)} — attempt ${i + 1}/${tries} in ${backoff}ms`,
+      )
+      await new Promise((r) => setTimeout(r, backoff))
+    }
+  }
+  throw last
+}
+
+// --------------------------------------------------------------------------
 // The one place that knows "fork" == "create from a snapshot". If Solari ever
-// ships a dedicated .fork(), change only this.
-// TODO: verify against Solari SDK — confirmed as create({ fromSnapshot }) from
-// docs.getsolari.com/snapshots, not yet run against a live key.
+// ships a dedicated .fork(), change only this. Confirmed live: rollback is
+// create({ fromSnapshot }); in-place revert() returns 409 on a running VM.
 // --------------------------------------------------------------------------
 async function fork(client: SolariClient, snapshotId: string, volumeId: string) {
-  return client.sandboxes.create({
-    template: "base",
-    fromSnapshot: snapshotId, // boot a fresh, independent copy of the checkpoint
-    // Mount the durable volume. Forks READ prior state from their own
-    // copy-on-write filesystem (carried by the snapshot); only the *winner*
-    // writes to the shared volume, so concurrent forks never collide.
-    volumes: [{ volumeId, path: "/data" }],
-  })
+  return withRetry("fork", () =>
+    client.sandboxes.create({
+      template: "base",
+      fromSnapshot: snapshotId, // boot a fresh, independent copy of the checkpoint
+      timeoutMs: IDLE_MS, // orphan-proofing: self-destruct if the run dies
+      // Mount the durable volume. Forks READ prior state from their own
+      // copy-on-write filesystem (carried by the snapshot); only the *winner*
+      // writes to the shared volume, so concurrent forks never collide.
+      volumes: [{ volumeId, path: "/data" }],
+    }),
+  )
 }
 
 /**
@@ -140,10 +198,11 @@ async function verifyStep(sandbox: any, step: number): Promise<boolean> {
 async function initCheckpoint(client: SolariClient, volumeId: string): Promise<string> {
   const sbx = await client.sandboxes.create({
     template: "base",
+    timeoutMs: IDLE_MS,
     volumes: [{ volumeId, path: "/data" }],
   })
   try {
-    await sbx.connect()
+    await withRetry("init.connect", () => sbx.connect())
     await sbx.commands.run("mkdir", { args: ["-p", "/work"] })
     await sbx.commands.run("sh", { args: ["-c", `: > ${WORK_LOG}`] }) // truncate/create empty
     // Snapshot = named save point we can fork or rewind to later. Returns a
@@ -163,9 +222,10 @@ async function initCheckpoint(client: SolariClient, volumeId: string): Promise<s
 async function runLinear(client: SolariClient, checkpoint: string, volumeId: string) {
   console.log("\n=== BASELINE: linear agent (1 attempt/step, no fork, no rollback) ===")
   const sbx = await fork(client, checkpoint, volumeId)
+  let step = 0
   try {
     await sbx.connect()
-    for (let step = 0; step < N_STEPS; step++) {
+    for (; step < N_STEPS; step++) {
       await runStep(sbx, step, /*fork*/ 0, /*retry*/ 0)
       const ok = await verifyStep(sbx, step)
       console.log(`  step ${String(step).padStart(2)}: ${ok ? "ok" : "BAD STATE"}`)
@@ -176,8 +236,14 @@ async function runLinear(client: SolariClient, checkpoint: string, volumeId: str
     }
     console.log("  linear run: PASSED")
     return { passed: true, failedAt: -1 }
+  } catch (e) {
+    // The baseline is expected to fail; a channel drop is just another way it
+    // dies. Don't let it crash the program before the harness gets to run.
+    if (!isRetryableStep(e)) throw e
+    console.log(`  step ${String(step).padStart(2)}: channel drop -> linear run aborted (baseline is fragile by design)`)
+    return { passed: false, failedAt: step }
   } finally {
-    await sbx.kill()
+    await sbx.kill().catch(() => {})
   }
 }
 
@@ -196,11 +262,15 @@ async function runBestOfN(client: SolariClient, checkpoint: string, volumeId: st
     let committed = false
 
     for (let retry = 0; retry <= MAX_RETRIES && !committed; retry++) {
-      // 1) FORK N independent copies of the current checkpoint, in parallel.
-      const forks = await Promise.all(
-        Array.from({ length: N_FORKS }, () => fork(client, currentCheckpoint, volumeId)),
-      )
+      let forks: Awaited<ReturnType<typeof fork>>[] = []
       try {
+        // 1) FORK N independent copies of the current checkpoint, in parallel.
+        forks = await Promise.all(
+          Array.from({ length: N_FORKS }, () => fork(client, currentCheckpoint, volumeId)),
+        )
+        // Any failure from here on (connect/run/verify) means a fork's channel
+        // is unhealthy. We do NOT retry the individual call — a dead channel
+        // won't heal — we let it bubble to the catch, which re-forks fresh.
         await Promise.all(forks.map((f) => f.connect()))
 
         // 2) Run the fragile step N ways IN PARALLEL, then VERIFY each fork's
@@ -216,16 +286,18 @@ async function runBestOfN(client: SolariClient, checkpoint: string, volumeId: st
         const winner = results.find((r) => r.ok)
 
         if (winner) {
-          // 3) SELECT the winner: snapshot its verified state -> new checkpoint,
-          //    and persist that verified state to the EXTERNAL volume.
-          currentCheckpoint = await winner.sbx.snapshot(`step-${step}-verified`)
-
+          // 3) SELECT the winner: snapshot its verified state and persist it to
+          //    the EXTERNAL volume. Advance the checkpoint ONLY after BOTH
+          //    succeed, so a mid-commit transient failure retries cleanly rather
+          //    than skipping the step from a half-applied state.
+          const newCheckpoint = await winner.sbx.snapshot(`step-${step}-verified`)
           // Persist verified state OUTSIDE the VM. Why a volume and not the
           // orchestrator's memory/chat history? (a) it survives VM death and
           // any orchestrator restart; (b) it keeps the driving transcript short
           // — no growing blob of intermediate state to re-read every turn, which
           // is how you avoid "context rot" degrading a long agent run.
           await winner.sbx.commands.run("cp", { args: [WORK_LOG, DATA_LOG] })
+          currentCheckpoint = newCheckpoint
 
           const tag = retry === 0 ? "" : ` (recovered on retry ${retry})`
           console.log(
@@ -239,10 +311,21 @@ async function runBestOfN(client: SolariClient, checkpoint: string, volumeId: st
             `  step ${String(step).padStart(2)}: [${verdict}] -> ALL FAILED, rollback to checkpoint, retry ${retry + 1}/${MAX_RETRIES}`,
           )
         }
+      } catch (e) {
+        // A dead control channel or a rate limit mid-step: discard the forks and
+        // retry the whole step from the last known-good checkpoint with FRESH
+        // forks. (A verifier FAIL is not an exception — it's handled above.)
+        if (!isRetryableStep(e)) throw e
+        console.log(
+          `  step ${String(step).padStart(2)}: [transient: ${String((e as Error).message ?? e).slice(0, 40)}] -> discard forks, re-fork, retry ${retry + 1}/${MAX_RETRIES}`,
+        )
       } finally {
         // Losers (and the winner, whose state is safe in the snapshot) are
-        // billed VMs — tear them all down.
-        await Promise.all(forks.map((f) => f.kill()))
+        // billed VMs — tear them all down. kill() is best-effort.
+        await Promise.all(forks.map((f) => f.kill().catch(() => {})))
+        // Let killed slots free before re-forking, so a retry doesn't 429 on a
+        // not-yet-released concurrency slot.
+        if (!committed) await new Promise((r) => setTimeout(r, 1500))
       }
     }
 
@@ -307,10 +390,11 @@ async function main() {
     // volume to a brand-new sandbox and read it back.
     const reader = await client.sandboxes.create({
       template: "base",
+      timeoutMs: IDLE_MS,
       volumes: [{ volumeId, path: "/data" }],
     })
     try {
-      await reader.connect()
+      await withRetry("reader.connect", () => reader.connect())
       const persisted = await reader.files.readText(DATA_LOG)
       console.log(`\n  Verified state persisted on the volume (${persisted.split("\n").filter(Boolean).length} steps):`)
       console.log(persisted.trim().split("\n").map((l) => `    ${l}`).join("\n"))
